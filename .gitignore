@@ -1,174 +1,406 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+#ton didnt working why it isimport asyncio
+import asyncio
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.enums import ParseMode
+from aiogram.utils.markdown import hbold
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import Command
+from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+import requests
+import logging
 
-# C extensions
-*.so
+TELEGRAM_TOKEN = "7487123046:AAFw_1nmyDYpZ5Auqg1vzKnag7ud89GXOQ8"
+ALERT_CHAT_ID = "@snipingallerts"
+STORAGE_PATH = "data/storage.json"
+HELIUS_API_KEY = "3e373521-16d3-42bc-8c88-4a186380bd3b"
+HELIUS_WEBHOOK_URL = "https://ff80-2409-40f3-1009-3116-6570-c849-aeaf-d03.ngrok-free.app/webhook"
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+from utils import (
+    add_wallet,
+    remove_wallet,
+    list_wallets,
+    set_base_wallet,
+    set_slippage,
+    set_amount,
+    clear_wallet_logs,
+    set_sim_slippage,
+    get_swap_logs,
+    get_simulation_logs,
+    delete_wallet_and_logs,
+    init_wallet_connection,
+    execute_swap,
+    schedule_auto_sell,
+    check_webhook_health,
+    log_swap_result,
+    add_sim_wallet,
+    list_sim_wallets,
+    delete_sim_wallet_and_logs,
+    sync_wallets_with_helius
+)
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+import json
+import os
+import datetime
+import time
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+bot = Bot(
+    token=TELEGRAM_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher(storage=MemoryStorage())
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
+sniping_active = False
+simulation_active = False
 
-# Translations
-*.mo
-*.pot
+recent_swaps = {}
+SWAP_COOLDOWN_SECONDS = 10
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+wallet_locks = {}
+swap_queue = asyncio.PriorityQueue()
 
-# Flask stuff:
-instance/
-.webassets-cache
+async def register_helius_webhook(wallet_addresses):
+    url = f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_API_KEY}"
+    payload = {
+        "webhookURL": HELIUS_WEBHOOK_URL,
+        "wallets": wallet_addresses,
+        "transactionTypes": ["TRANSFER", "SWAP", "TOKEN_MINT", "CREATE_POOL"],
+        "webhookType": "enhanced"
+    }
+    response = requests.post(url, json=payload)
+    print("Webhook registration response:", response.json())
 
-# Scrapy stuff:
-.scrapy
+async def sync_wallets_with_helius():
+    try:
+        with open(STORAGE_PATH, "r") as f:
+            data = json.load(f)
+        wallets = data.get("wallets", [])
 
-# Sphinx documentation
-docs/_build/
+        if not wallets:
+            print("No wallets to sync.")
+            return
 
-# PyBuilder
-.pybuilder/
-target/
+        url = f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_API_KEY}"
+        payload = {
+            "webhookURL": HELIUS_WEBHOOK_URL,
+            "wallets": wallets,
+            "transactionTypes": ["TRANSFER", "SWAP", "TOKEN_MINT", "CREATE_POOL"],
+            "webhookType": "enhanced"
+        }
+        response = requests.post(url, json=payload)
+        print("Helius sync response:", response.json())
 
-# Jupyter Notebook
-.ipynb_checkpoints
+    except Exception as e:
+        print(f"[Helius Sync Error]: {e}")
 
-# IPython
-profile_default/
-ipython_config.py
+async def enqueue_swap(wallet, token, priority=1):
+    now = time.time()
+    if token in recent_swaps and now - recent_swaps[token] < SWAP_COOLDOWN_SECONDS:
+        return
+    recent_swaps[token] = now
+    await swap_queue.put((priority, wallet, token))
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+async def swap_worker():
+    while True:
+        priority, wallet, token = await swap_queue.get()
+        if wallet not in wallet_locks:
+            wallet_locks[wallet] = asyncio.Lock()
+        async with wallet_locks[wallet]:
+            try:
+                success = await execute_swap(wallet, token)
+                if success:
+                    await bot.send_message(ALERT_CHAT_ID, f"✅ Swap executed on token {token} for wallet {wallet}")
+                    asyncio.create_task(schedule_auto_sell(wallet, token, delay=60))
+                else:
+                    await bot.send_message(ALERT_CHAT_ID, f"❌ Swap failed for token {token} and wallet {wallet}")
+            except Exception as e:
+                await bot.send_message(ALERT_CHAT_ID, f"🚨 Error during swap: {e}")
+            finally:
+                swap_queue.task_done()
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+async def init_helius_webhook_listener():
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+    import uvicorn
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+    app = FastAPI()
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
+    @app.post("/webhook")
+    async def webhook_listener(request: Request):
+        body = await request.json()
+        events = body.get("events", [])
+        for event in events:
+            event_type = event.get("type")
+            token = event.get("nativeMint") or event.get("mint")
+            source_wallet = event.get("source") or event.get("owner") or "global"
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#pdm.lock
-#   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
-#   in version control.
-#   https://pdm.fming.dev/latest/usage/project/#working-with-version-control
-.pdm.toml
-.pdm-python
-.pdm-build/
+            if event_type in ["CREATE_POOL", "TOKEN_MINT"] and token:
+                await enqueue_swap(source_wallet, token)
+        return JSONResponse(content={"status": "ok"})
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+class InputState(StatesGroup):
+    slippage = State()
+    amount = State()
+    confirm_delete = State()
+    confirm_sim_delete = State()  # ← Add this
+    base_wallet_key = State()
+    add_wallet = State()
+    add_sim_wallet = State()
+    sim_slippage = State()
 
-# SageMath parsed files
-*.sage.py
+main_menu_kb = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🔫 Sniping Settings", callback_data="sniping_settings")],
+    [InlineKeyboardButton(text="📊 Dashboard", callback_data="dashboard")],
+    [InlineKeyboardButton(text="🧪 Simulation Settings", callback_data="simulation_settings")]
+])
 
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+sniping_kb = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🔗 Connect Wallet", callback_data="connect_wallet")],
+    [InlineKeyboardButton(text="➕ Add Wallet", callback_data="add_wallet")],
+    [InlineKeyboardButton(text="📋 List Wallets", callback_data="list_wallets")],
+    [InlineKeyboardButton(text="❌ Delete Wallet", callback_data="remove_wallet")],
+    [InlineKeyboardButton(text="📉 Adjust Slippage", callback_data="set_slippage")],
+    [InlineKeyboardButton(text="💰 Set Swap Amount", callback_data="set_amount")],
+    [InlineKeyboardButton(text="▶ Start", callback_data="start_sniping")],
+    [InlineKeyboardButton(text="⏹ Stop", callback_data="stop_sniping")]
+])
 
-# Spyder project settings
-.spyderproject
-.spyproject
+simulation_kb = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="➕ Add Simulation Wallet", callback_data="add_sim_wallet")],
+    [InlineKeyboardButton(text="📋 List Simulation Wallets", callback_data="list_sim_wallets")],
+    [InlineKeyboardButton(text="❌ Delete Simulation Wallets", callback_data="remove_sim_wallet")],
+    [InlineKeyboardButton(text="📉 Set Simulation Slippage", callback_data="set_sim_slippage")],
+    [InlineKeyboardButton(text="📊 Simulation Dashboard", callback_data="simulation_dashboard")],
+    [InlineKeyboardButton(text="▶ Start Simulation", callback_data="start_simulation")],
+    [InlineKeyboardButton(text="⏹ Stop Simulation", callback_data="stop_simulation")]
+])
 
-# Rope project settings
-.ropeproject
+@dp.message(Command("start"))
+async def handle_start(message: types.Message):
+    await message.answer(
+        "👋 Welcome to the Million Wings Sniping Bot!\nChoose an option below:",
+        reply_markup=main_menu_kb
+    )
 
-# mkdocs documentation
-/site
+@dp.callback_query(F.data == "sniping_settings")
+async def handle_sniping_settings(callback: types.CallbackQuery):
+    logging.info("Sniping Settings button clicked.")
+    await callback.message.edit_text("🔫 Sniping Settings Menu:", reply_markup=sniping_kb)
+    await callback.answer()
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+@dp.callback_query(F.data == "connect_wallet")
+async def handle_connect_wallet(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(InputState.base_wallet_key)
+    await callback.message.answer("🔐 Please send your base wallet private key:")
+    await callback.answer()
 
-# Pyre type checker
-.pyre/
+@dp.message(InputState.base_wallet_key)
+async def receive_base_wallet_key(message: types.Message, state: FSMContext):
+    key = message.text.strip()
+    set_base_wallet(key)
+    await message.answer("✅ Base wallet connected successfully.")
+    await state.clear()
 
-# pytype static type analyzer
-.pytype/
+@dp.callback_query(F.data == "add_wallet")
+async def handle_add_wallet(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(InputState.add_wallet)
+    await callback.message.answer("➕ Send the wallet address to watch:")
+    await callback.answer()
 
-# Cython debug symbols
-cython_debug/
+@dp.message(InputState.add_wallet)
+async def receive_add_wallet(message: types.Message, state: FSMContext):
+    address = message.text.strip()
+    
+    wallets = list_wallets()
+    print("Before adding, wallets:", wallets)  # DEBUG
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+    if len(wallets) >= 15:
+        await message.answer("⚠️ You can only add up to 15 wallets. Please remove one before adding a new one.")
+    elif add_wallet(address, STORAGE_PATH):
+        wallets = list_wallets()
+        print("After adding, wallets:", wallets)  # DEBUG
+        await message.answer(f"✅ Wallet <code>{address}</code> added to watchlist.")
+    else:
+        await message.answer(f"⚠️ Wallet <code>{address}</code> already exists.")
+    
+    await state.clear()
 
-# Ruff stuff:
-.ruff_cache/
 
-# PyPI configuration file
-.pypirc
+
+
+@dp.callback_query(F.data == "list_wallets")
+async def handle_list_wallets(callback: types.CallbackQuery):
+    wallets = list_wallets()
+    print("[DEBUG] Listed wallets:", wallets)
+    if wallets:
+        msg = "\n".join([f"• <code>{w}</code>" for w in wallets])
+    else:
+        msg = "No wallets added yet."
+    await callback.message.edit_text(f"📋 Watched Wallets:\n{msg}", reply_markup=sniping_kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "remove_wallet")
+async def handle_remove_wallet(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(InputState.confirm_delete)
+    await callback.message.answer("🗑️ Send the wallet address you want to delete:")
+    await callback.answer()
+
+@dp.message(InputState.confirm_delete)
+async def confirm_wallet_delete(message: types.Message, state: FSMContext):
+    address = message.text.strip()
+    print("Trying to delete:", address)
+    print("Current wallets list:", list_wallets())
+    if delete_wallet_and_logs(address):
+        await message.answer(f"✅ Deleted wallet <code>{address}</code> and its logs.")
+    else:
+        await message.answer(f"❌ Wallet <code>{address}</code> not found.")
+    await state.clear()
+
+@dp.callback_query(F.data == "set_slippage")
+async def handle_set_slippage(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(InputState.slippage)
+    await callback.message.answer("📉 Send the slippage percentage for swaps (e.g., 1 for 1%):")
+    await callback.answer()
+
+@dp.message(InputState.slippage)
+async def receive_slippage(message: types.Message, state: FSMContext):
+    try:
+        slippage = float(message.text.strip())
+        set_slippage(slippage)
+        await message.answer(f"✅ Slippage set to {slippage}%")
+    except ValueError:
+        await message.answer("❌ Invalid input. Please enter a number like 1 or 0.5")
+    await state.clear()
+
+@dp.callback_query(F.data == "set_amount")
+async def handle_set_amount(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(InputState.amount)
+    await callback.message.answer("💰 Send the swap amount in USDT:")
+    await callback.answer()
+
+@dp.message(InputState.amount)
+async def receive_swap_amount(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text.strip())
+        set_amount(amount)
+        await message.answer(f"✅ Swap amount set to {amount} USDT")
+    except ValueError:
+        await message.answer("❌ Invalid input. Please enter a number like 100")
+    await state.clear()
+
+@dp.callback_query(F.data == "start_sniping")
+async def start_sniping(callback: types.CallbackQuery):
+    global sniping_active
+    sniping_active = True
+    await callback.message.answer("▶ Sniping started.")
+    await callback.answer()
+
+@dp.callback_query(F.data == "stop_sniping")
+async def stop_sniping(callback: types.CallbackQuery):
+    global sniping_active
+    sniping_active = False
+    await callback.message.answer("⏹ Sniping stopped.")
+    await callback.answer()
+
+@dp.callback_query(F.data == "simulation_settings")
+async def handle_simulation_settings(callback: types.CallbackQuery):
+    await callback.message.edit_text("🧪 Simulation Settings Menu:", reply_markup=simulation_kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "dashboard")
+async def handle_dashboard(callback: types.CallbackQuery):
+    await callback.message.edit_text("📊 Dashboard coming soon!")
+    await callback.answer()
+
+@dp.callback_query(F.data == "add_sim_wallet")
+async def handle_add_sim_wallet(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(InputState.add_sim_wallet)
+    await callback.message.answer("🔢 Please send the simulation wallet address you want to add:")
+    await callback.answer()
+
+@dp.message(InputState.add_sim_wallet)
+async def receive_sim_wallet(message: types.Message, state: FSMContext):
+    address = message.text.strip()
+    if add_sim_wallet(address):
+        await message.answer(f"✅ Wallet <code>{address}</code> added to simulation watchlist.")
+    else:
+        await message.answer(f"⚠️ Wallet <code>{address}</code> is already in the simulation list.")
+    await state.clear()
+
+@dp.callback_query(F.data == "list_sim_wallets")
+async def handle_list_sim_wallets(callback: types.CallbackQuery):
+    wallets = list_sim_wallets()
+    if wallets:
+        msg = "\n".join([f"• <code>{w}</code>" for w in wallets])
+    else:
+        msg = "No simulation wallets added yet."
+    await callback.message.edit_text(f"📋 Simulation Wallets:\n{msg}", reply_markup=simulation_kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "remove_sim_wallet")
+async def handle_remove_sim_wallet(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(InputState.confirm_sim_delete)
+    await callback.message.answer("🧹 Send the simulation wallet address you want to delete:")
+    await callback.answer()
+
+
+@dp.message(InputState.confirm_sim_delete)
+async def confirm_sim_wallet_delete(message: types.Message, state: FSMContext):
+    # Clean the wallet address (remove spaces and convert to lowercase for consistency)
+    address = message.text.strip()  # Assuming Solana addresses are lowercase
+
+    # Log the address being attempted for deletion (for debugging)
+    print(f"Attempting to delete wallet address: {address}")
+
+    # Check if the address is in the list of simulation wallets
+    wallets = list_sim_wallets()  # This function should return a list of all sim wallets
+    print(f"Current simulation wallets: {wallets}")  # Log current list for debugging
+
+    if address in wallets:
+        # If the wallet is found, proceed with deletion
+        if delete_sim_wallet_and_logs(address):  # Your function to remove wallet and logs
+            await message.answer(f"✅ Deleted simulation wallet <code>{address}</code> and its logs.")
+        else:
+            await message.answer(f"❌ An error occurred while deleting wallet <code>{address}</code>.")
+    else:
+        # If the wallet address is not found in the list
+        await message.answer(f"❌ Simulation wallet <code>{address}</code> not found in the watchlist.")
+
+    await state.clear()
+
+
+@dp.callback_query(F.data == "set_sim_slippage")
+async def handle_sim_slippage(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(InputState.sim_slippage)
+    await callback.message.answer("📉 Send the slippage percentage for simulation swaps (e.g., 1 for 1%):")
+    await callback.answer()
+
+@dp.message(InputState.sim_slippage)
+async def receive_sim_slippage(message: types.Message, state: FSMContext):
+    try:
+        slippage = float(message.text.strip())
+        set_sim_slippage(slippage)
+        await message.answer(f"✅ Simulation slippage set to {slippage}%")
+    except ValueError:
+        await message.answer("❌ Invalid input. Please enter a number like 1 or 0.5")
+    await state.clear()
+
+@dp.callback_query(F.data == "simulation_dashboard")
+async def handle_sim_dashboard(callback: types.CallbackQuery):
+    await callback.message.edit_text("📊 Simulation Dashboard coming soon!", reply_markup=simulation_kb)
+    await callback.answer()
+
+if __name__ == "__main__":
+    async def main():
+        logging.basicConfig(level=logging.INFO)
+        asyncio.create_task(swap_worker())
+        asyncio.create_task(init_helius_webhook_listener())
+        await dp.start_polling(bot)
+
+    asyncio.run(main())

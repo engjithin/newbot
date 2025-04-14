@@ -1,0 +1,38 @@
+{
+  "wallets": [
+    "wallet1_pubkey",
+    "wallet2_pubkey"
+  ]
+}
+
+{
+  "logs": [],
+  "simulation_logs": [],
+  "watched_wallets": [],
+  "base_wallet": "",
+  "slippage": 0.5,
+  "swap_amount": 0.01
+}
+{
+  "wallets": [],
+  "sim_wallets": []
+}
+{
+  "sim_wallets": [
+    "your_added_wallet_here"
+  ]
+}
+{
+  "wallets": [...],
+  "simulation_wallets": [
+    "wallet1",
+    "wallet2"
+  ]
+}
+{
+    "simulation_wallets": [
+        "CQiybuwMSeqVxeFS8kkVm9sCCjSQdcKH3UP2ygKXie5z",
+        "AnotherWalletAddressHere"
+    ]
+}
+
